@@ -31,12 +31,10 @@ e22_transceiver.py — приём/передача данных через USB-�
     python e22_transceiver.py --port COM5 --baud 9600
 
     # адресный обмен с узлом 0x0002 на канале 19, с отображением RSSI
-    python e22_transceiver.py --port COM5 --baud 9600 \\
-        --peer-address 0x0002 --channel 19 --rssi
+    python e22_transceiver.py --port COM5 --baud 9600 --peer-address 0x0002 --channel 19 --rssi
 
     # разовая отправка одной строки и выход
-    python e22_transceiver.py --port COM5 --baud 9600 \\
-        --peer-address 0x0002 --channel 19 --send "hello lora"
+    python e22_transceiver.py --port COM5 --baud 9600 --peer-address 0x0002 --channel 19 --send "hello lora"
 """
 
 import argparse
