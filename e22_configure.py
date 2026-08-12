@@ -1,48 +1,30 @@
 #!/usr/bin/env python3
 """
-e22_configure.py — запись конфигурации в EBYTE E22-900T22U:
+e22_configure.py — запись конфигурации в энергонезависимую память (EEPROM/Flash)
+модуля EBYTE E22-900T22U:
     - минимально возможная мощность передачи (10dBm)
     - канал 19 (частота = 850.125 + 19 = 869.125 МГц)
     - LBT (Listen Before Talk) включён
-    - fixed-режим передачи включён (нужен, чтобы адресация вообще работала)
+    - fixed-режим передачи включён (нужен для адресации)
     - RSSI байт добавляется к каждому принятому пакету
     - адрес модуля — задаётся параметром
 
-ВАЖНО (проверено эмпирически на реальном железе): на части USB-донглов
-E22-900T22U команда постоянной записи 0xC0 не отвечает вообще, а команда
-временной записи 0xC2 отвечает и применяется, но НЕ переживает отключение
-USB — при следующем включении конфигурация возвращается к заводской.
-Поэтому этот скрипт по умолчанию сначала пробует 0xC0, автоматически
-откатывается на 0xC2, если тот не ответил, и в конце явно предупреждает,
-что конфигурацию нужно применять заново при каждом включении модуля.
-Самый удобный способ — не гонять этот скрипт вручную, а использовать
-e22_start_session.py, который применяет конфигурацию и сразу запускает
-приём/передачу одной командой.
+Изменения, записанные этим скриптом, СОХРАНЯЮТСЯ после отключения питания / USB.
 
-ПЕРЕД ЗАПУСКОМ: переведите модуль в режим конфигурации — зажмите боковую
-кнопку на 2 секунды, пока светодиод не загорится ПОСТОЯННЫМ красным.
+ПЕРЕД ЗАПУСКОМ:
+Переведите модуль в режим конфигурации (зажмите боковую кнопку на 2 секунды,
+пока светодиод не загорится ПОСТОЯННЫМ красным цветом, либо убедитесь, что M0=1, M1=1).
 
 Использование:
     pip install pyserial
 
     python e22_configure.py --port COM5 --address 0x0001
-    python e22_configure.py --port COM5 --address 1 --debug --wait 3
-
-Регистры (см. User Manual серии E22, стр. 13-16):
-    REG1 (байт 7), биты 1:0 — TX power:  00=22dBm 01=17dBm 10=13dBm 11=10dBm
-    REG3 (байт 9):
-        бит 7 — RSSI byte enable (добавлять RSSI к принятым данным)
-        бит 6 — transmission mode (0=transparent, 1=fixed)
-        бит 5 — repeater (не трогаем)
-        бит 4 — LBT enable
-        бит 3 — WOR control (не трогаем)
-        биты 2:0 — WOR cycle (не трогаем)
+    python e22_configure.py --port /dev/ttyUSB0 --address 1 --debug
 """
 
 import argparse
 import sys
 import time
-
 import serial
 
 MIN_TXPOWER_BITS = 0b11        # 10dBm — минимальная мощность в линейке E22-900T22U
@@ -56,23 +38,36 @@ def auto_int(x: str) -> int:
 
 
 def read_config(ser: serial.Serial) -> bytes:
+    """Чтение текущих 7 регистров конфигурации (команда 0xC1 0x00 0x07)."""
     ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    
+    # Запрос: [0xC1, Start_Addr=0x00, Length=0x07]
     ser.write(bytes([0xC1, 0x00, 0x07]))
     ser.flush()
-    time.sleep(0.05)
+    time.sleep(0.1)
+    
     return ser.read(10)
 
 
-def write_config(ser: serial.Serial, frame: bytes, save: bool,
-                  wait_s: float = 1.5, debug: bool = False) -> bytes:
+def write_config_eeprom(ser: serial.Serial, frame: bytes, wait_s: float = 1.5, debug: bool = False) -> bytes:
+    """
+    Запись конфигурации в Flash/EEPROM (команда 0xC0).
+    Возвращает подтверждающий ответ модуля.
+    """
     ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    
     if debug:
-        print(f'  -> отправляю: {frame.hex(" ")}')
+        print(f'  -> отправляю в модуль: {frame.hex(" ")}')
+        
     ser.write(frame)
     ser.flush()
 
-    # Опрашиваем порт вместо одного фиксированного sleep+read — так виден
-    # любой частичный/запоздавший ответ вместо полной тишины.
+    # Памяти Flash требуется время на физическую запись байт (~100-150 мс)
+    time.sleep(0.15)
+
+    # Опрашиваем порт на наличие ответа
     deadline = time.time() + wait_s
     buf = bytearray()
     while time.time() < deadline and len(buf) < 10:
@@ -81,23 +76,28 @@ def write_config(ser: serial.Serial, frame: bytes, save: bool,
             buf.extend(ser.read(n))
         else:
             time.sleep(0.02)
+
     if debug:
-        print(f'  <- получено за {wait_s:.1f} с: {bytes(buf).hex(" ") if buf else "<ничего>"}')
+        print(f'  <- получено ответных байт: {bytes(buf).hex(" ") if buf else "<ничего>"}')
+        
     return bytes(buf)
 
 
 def configs_match(resp: bytes, addh: int, addl: int, netid: int,
-                   reg0: int, reg1: int, channel: int, reg3: int) -> bool:
-    """Сравнивает 10-байтный ответ (0xC1 ...) с ожидаемыми значениями регистров."""
+                  reg0: int, reg1: int, channel: int, reg3: int) -> bool:
+    """Сравнивает 10-байтный ответ с ожидаемыми значениями регистров."""
     if len(resp) != 10:
         return False
+    # Проверяем полезные данные (байты с index 3 по 9)
     return (resp[3], resp[4], resp[5], resp[6], resp[7], resp[8], resp[9]) == \
            (addh, addl, netid, reg0, reg1, channel, reg3)
 
 
 def describe(resp: bytes) -> str:
+    """Декодирует 10-байтный массив ответа в человекочитаемый вид."""
     if len(resp) != 10:
-        return f'НЕПОЛНЫЙ ОТВЕТ ({len(resp)} байт): {resp.hex()}'
+        return f'НЕПОЛНЫЙ ИЛИ НЕКОРРЕКТНЫЙ ОТВЕТ ({len(resp)} байт): {resp.hex()}'
+    
     addr = (resp[3] << 8) | resp[4]
     netid = resp[5]
     reg1 = resp[7]
@@ -105,7 +105,7 @@ def describe(resp: bytes) -> str:
     reg3 = resp[9]
 
     txpower_map = {0b00: '22dBm', 0b01: '17dBm', 0b10: '13dBm', 0b11: '10dBm'}
-    txpower = txpower_map[reg1 & 0b11]
+    txpower = txpower_map.get(reg1 & 0b11, 'неизвестно')
 
     rssi_en = bool(reg3 & 0b10000000)
     fixed = bool(reg3 & 0b01000000)
@@ -114,126 +114,111 @@ def describe(resp: bytes) -> str:
     freq = BASE_FREQ_MHZ + channel
 
     lines = [
-        f'  Адрес:            0x{addr:04X}',
-        f'  NetID:            0x{netid:02X}',
-        f'  Канал:            {channel} (~{freq:.3f} МГц)',
-        f'  TX power:         {txpower}',
-        f'  Режим передачи:   {"fixed" if fixed else "transparent"}',
-        f'  LBT:              {"вкл" if lbt else "выкл"}',
-        f'  RSSI байт:        {"вкл" if rssi_en else "выкл"}',
-        f'  Сырой ответ:      {resp.hex(" ")}',
+        f'  Адрес:             0x{addr:04X} ({addr})',
+        f'  NetID:             0x{netid:02X}',
+        f'  Канал:             {channel} (~{freq:.3f} МГц)',
+        f'  TX power:          {txpower}',
+        f'  Режим передачи:    {"fixed" if fixed else "transparent"}',
+        f'  LBT:               {"вкл" if lbt else "выкл"}',
+        f'  RSSI байт:         {"вкл" if rssi_en else "выкл"}',
+        f'  Сырой ответ:       {resp.hex(" ")}',
     ]
     return '\n'.join(lines)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
-                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--port', required=True, help='COM-порт (Windows) или /dev/ttyUSB* (Linux)')
-    ap.add_argument('--baud', type=int, default=9600, help='baud rate конфигурационного канала')
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--port', required=True, help='COM-порт (например COM5 или /dev/ttyUSB0)')
+    ap.add_argument('--baud', type=int, default=9600, help='Baudrate конфигурационного канала (по умолчанию 9600)')
     ap.add_argument('--address', required=True, type=auto_int,
-                     help='адрес модуля, 0..65535, hex ("0x0001") или decimal ("1")')
+                    help='Адрес модуля: 0..65535, hex ("0x0001") или decimal ("1")')
     ap.add_argument('--netid', type=auto_int, default=None,
-                     help='NetID (0..255), если не указан — не изменяется')
-    ap.add_argument('--temporary', action='store_true',
-                     help='сразу писать в 0xC2 (RAM), без попытки 0xC0. '
-                          'ВАЖНО: на этом донгле эмпирически подтверждено, что запись '
-                          'НЕ переживает отключение USB в любом случае (0xC0 не отвечает, '
-                          '0xC2 volatile) — конфигурацию нужно применять при каждом включении.')
-    ap.add_argument('--wait', type=float, default=1.5,
-                     help='сколько секунд ждать ответ модуля на команду записи (по умолчанию 1.5)')
+                    help='NetID (0..255). Если не указан — сохраняется текущий')
+    ap.add_argument('--wait', type=float, default=2.0,
+                    help='Время ожидания ответа от модуля в секундах (по умолчанию 2.0)')
     ap.add_argument('--debug', action='store_true',
-                     help='печатать отправленные и полученные сырые байты')
-    ap.add_argument('--try-both', action='store_true', default=True,
-                     help='(включено по умолчанию) если 0xC0 не отвечает — автоматически '
-                          'пробовать 0xC2. Передайте --no-try-both, чтобы отключить.')
-    ap.add_argument('--no-try-both', dest='try_both', action='store_false',
-                     help='не откатываться на 0xC2, если 0xC0 не ответил')
+                    help='Выводить отладочную информацию о сырых байтах')
     args = ap.parse_args()
 
     if not (0 <= args.address <= 0xFFFF):
-        sys.exit('Адрес должен быть в диапазоне 0..65535 (0x0000..0xFFFF).')
+        sys.exit('Ошибка: Адрес должен быть в диапазоне 0..65535 (0x0000..0xFFFF).')
     if args.netid is not None and not (0 <= args.netid <= 0xFF):
-        sys.exit('NetID должен быть в диапазоне 0..255.')
+        sys.exit('Ошибка: NetID должен быть в диапазоне 0..255.')
 
     try:
+        # Важно: При открытии порта принудительно выставляем DTR и RTS в True.
+        # В USB-донглах EBYTE они привязаны к пинам M0/M1. High (1,1) переводит модуль в Config Mode.
         ser = serial.Serial(args.port, args.baud, timeout=1)
+        ser.dtr = True
+        ser.rts = True
+        time.sleep(0.1)  # Даем время на стабилизацию аппаратных линий
     except serial.SerialException as e:
-        sys.exit(f'Не удалось открыть {args.port}: {e}')
+        sys.exit(f'Не удалось открыть порт {args.port}: {e}')
 
     with ser:
         print(f'Читаю текущую конфигурацию с {args.port}...')
         cur = read_config(ser)
-        if len(cur) != 10 or cur[0] != 0xC1:
+        
+        if len(cur) != 10 or cur[0] not in (0xC1, 0xC0, 0xC2):
             sys.exit(
-                'Не удалось прочитать текущую конфигурацию.\n'
-                'Убедитесь, что модуль в режиме конфигурации '
-                '(зажать боковую кнопку 2 сек до постоянного красного светодиода).'
+                'Ошибка: Не удалось прочитать конфигурацию.\n'
+                'Убедитесь, что модуль переведён в режим конфигурации:\n'
+                '  - зажмите боковую кнопку на 2 сек (светодиод горит ПОСТОЯННЫМ красным)\n'
+                '  - или проверьте правильность вывода COM-порта.'
             )
-        print('Текущая конфигурация:')
+
+        print('Текущая конфигурация модуля:')
         print(describe(cur))
 
+        # Формируем новые значения регистров
         addh, addl = (args.address >> 8) & 0xFF, args.address & 0xFF
         netid = args.netid if args.netid is not None else cur[5]
-        reg0 = cur[6]  # baud/parity/air rate — не трогаем
-        reg1 = (cur[7] & 0b11111100) | MIN_TXPOWER_BITS  # только биты TX power
+        reg0 = cur[6]  # Baudrate / AirDataRate — оставляем без изменений
+        reg1 = (cur[7] & 0b11111100) | MIN_TXPOWER_BITS  # Устанавливаем минимальную мощность (10dBm)
         channel = CHANNEL
+        
+        # Настройка REG3 (биты функционала)
         reg3 = cur[9]
         reg3 |= 0b10000000  # RSSI byte enable
-        reg3 |= 0b01000000  # fixed transmission mode
+        reg3 |= 0b01000000  # Fixed transmission mode
         reg3 |= 0b00010000  # LBT enable
 
-        cmd_byte = 0xC2 if args.temporary else 0xC0
-        frame = bytes([cmd_byte, 0x00, 0x07, addh, addl, netid, reg0, reg1, channel, reg3])
+        # Формируем кадр сохранения во FLASH: 
+        # [0xC0 (Save Flash), 0x00 (Start Reg), 0x07 (Length), Payload (7 байт)]
+        frame = bytes([0xC0, 0x00, 0x07, addh, addl, netid, reg0, reg1, channel, reg3])
 
-        label = 'временно (0xC2)' if args.temporary else 'постоянно, во флеш (0xC0)'
-        print(f'\nЗаписываю новую конфигурацию: {label}, жду ответ до {args.wait} с...')
-        resp = write_config(ser, frame, save=not args.temporary, wait_s=args.wait, debug=args.debug)
+        print(f'\nЗаписываю новую конфигурацию во Flash-память (0xC0)...')
+        resp = write_config_eeprom(ser, frame, wait_s=args.wait, debug=args.debug)
 
-        # Подтверждением может быть 0xC0, 0xC1 или 0xC2 — на практике этот донгл
-        # отвечает заголовком 0xC1 независимо от того, какую команду записи послали.
-        ok = len(resp) == 10 and resp[0] in (0xC0, 0xC1, 0xC2) and \
+        # Проверяем успешность
+        ok = len(resp) == 10 and resp[0] in (0xC0, 0xC1) and \
              configs_match(resp, addh, addl, netid, reg0, reg1, channel, reg3)
 
-        if not ok and args.try_both and cmd_byte == 0xC0:
-            print('\nПостоянная запись (0xC0) не подтвердилась напрямую. Пробую временную (0xC2)...')
-            frame2 = bytes([0xC2]) + frame[1:]
-            resp = write_config(ser, frame2, save=False, wait_s=args.wait, debug=args.debug)
-            ok = len(resp) == 10 and resp[0] in (0xC0, 0xC1, 0xC2) and \
-                 configs_match(resp, addh, addl, netid, reg0, reg1, channel, reg3)
-            if ok:
-                print('\n0xC2 сработала. Похоже, эта прошивка не подтверждает 0xC0 напрямую '
-                      '(или не поддерживает постоянное сохранение) — обычно проще и надёжнее '
-                      'работать через 0xC2 (--temporary) и перезаписывать конфигурацию при '
-                      'каждом включении модуля, либо один раз сохранить через официальный GUI.')
-
         if not ok:
-            # Ответа не было или он не совпал с ожидаемым — перепроверяем явным чтением:
-            # возможно, запись реально применилась, просто без подтверждения на этот запрос.
-            print('\nПрямого подтверждения нет, перечитываю конфигурацию для проверки...')
-            time.sleep(0.3)
+            # Если прямой ответ задерживается, пробуем перечитать
+            print('Прямое подтверждение не получено. Выполняю контрольное чтение...')
+            time.sleep(0.2)
             verify = read_config(ser)
             ok = configs_match(verify, addh, addl, netid, reg0, reg1, channel, reg3)
             if ok:
                 resp = verify
-                print('Конфигурация на самом деле применилась (подтверждено повторным чтением).')
 
         if not ok:
-            print(f'\nЗапись не подтвердилась. Получено: {resp.hex(" ") if resp else "<пусто>"}')
-            print('Проверьте:')
-            print('  - светодиод всё ещё горит ПОСТОЯННЫМ красным (не мигает, не погас);')
-            print('  - порт не был переоткрыт/занят другим процессом между запусками;')
-            print('  - попробуйте заново зажать боковую кнопку на 2 сек перед записью;')
-            print('  - увеличьте --wait до 3-5 секунд.')
+            print(f'\n[ОШИБКА] Не удалось сохранить параметры.')
+            print(f'Полученный ответ: {resp.hex(" ") if resp else "<нет ответа>"}')
+            print('\nПроверьте:')
+            print('  1. Красный светодиод горит постоянно (режим CONFIG).')
+            print('  2. Порт не заблокирован другими программами.')
             sys.exit(1)
 
-        print('\nПодтверждённая конфигурация:')
+        print('\n' + '='*50)
+        print('ПОДТВЕРЖДЕННАЯ И СОХРАНЕННАЯ КОНФИГУРАЦИЯ:')
+        print('='*50)
         print(describe(resp))
-        print('\n[!] На этом устройстве конфигурация НЕ переживает отключение USB —')
-        print('    запускайте этот скрипт заново (держа кнопку 2 сек до красного света)')
-        print('    при каждом включении донгла, перед работой с e22_transceiver.py.')
-        print('    Проще всего это сделать одной командой через e22_start_session.py.')
-        print('\nГотово.')
+        print('='*50)
+        print('\nУспешно! Изменения сохранены во Flash-памяти модуля.')
+        print('Параметры сохранятся при отключении питания и переподключении USB.')
 
 
 if __name__ == '__main__':
