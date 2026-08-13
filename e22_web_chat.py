@@ -43,6 +43,7 @@ e22_web_chat.py — веб-чат для обмена сообщениями ч�
 
 import argparse
 import itertools
+import logging
 import sys
 import threading
 import time
@@ -170,6 +171,12 @@ def reader_thread(stop_event: threading.Event, settle_s: float = 0.08) -> None:
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+
+# Werkzeug по умолчанию пишет access-log на КАЖДЫЙ HTTP-запрос — при опросе
+# /api/messages раз в секунду это быстро забивает journalctl бесполезными
+# строками. Оставляем только предупреждения/ошибки; события LoRa (RX/TX)
+# логируются отдельно через print() ниже.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 PAGE_HTML = """<!doctype html>
 <html lang="ru">
@@ -371,6 +378,8 @@ def api_send():
         return jsonify({"error": f"serial write failed: {e}"}), 500
 
     msg = chat.add("tx", text)
+    rssi_note = ""  # для TX RSSI не применим
+    print(f"[TX] {text!r}{rssi_note}", flush=True)
     return jsonify(msg)
 
 
