@@ -9,16 +9,16 @@ After=network.target
 [Service]
 Type=simple
 # Замените на реального пользователя (должен быть в группе dialout)
-User=pi
-Group=pi
-WorkingDirectory=/home/pi/lora-web-chat
+User=frolov
+Group=frolov
+WorkingDirectory=/home/frolov/lora-web-chat
 
 # Пример для адресного режима с RSSI на канале 19, узел-собеседник 0x0002.
 # Подставьте свой /dev/ttyUSB* или, лучше, устойчивое имя из /dev/serial/by-id/.
-ExecStart=/usr/bin/python3 /home/pi/lora-web-chat/e22_web_chat.py \
+ExecStart=/usr/bin/python3 /home/frolov/lora-web-chat/e22_web_chat.py \
     --port /dev/ttyUSB0 \
     --baud 9600 \
-    --peer-address 0x0002 \
+    --peer-address 0x0001 \
     --channel 19 \
     --rssi \
     --web-host 0.0.0.0 \
