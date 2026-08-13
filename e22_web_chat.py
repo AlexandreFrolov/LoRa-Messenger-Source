@@ -3,8 +3,8 @@
 e22_web_chat.py — веб-чат для обмена сообщениями через USB-донгл EBYTE E22-900T22U.
 
 Поднимает локальный Flask-сервер с простой веб-страницей:
-  - сообщения, принятые по LoRa от удалённого узла, появляются в чат-ленте
-    в реальном времени (страница опрашивает сервер через AJAX);
+  - сообщения, принятые по LoRa от удалённого узла, доставляются в браузер
+    мгновенно через WebSocket (без опроса сервера);
   - текст, введённый в поле на странице, отправляется в эфир через тот же
     последовательный порт, что и в e22_transceiver.py.
 
@@ -22,7 +22,7 @@ e22_web_chat.py — веб-чат для обмена сообщениями ч�
 как RSSI, а не как часть текста.
 
 Установка зависимостей:
-    pip install pyserial flask
+    pip install pyserial flask flask-sock
 
 Примеры запуска:
     # список доступных портов
@@ -43,7 +43,9 @@ e22_web_chat.py — веб-чат для обмена сообщениями ч�
 
 import argparse
 import itertools
+import json
 import logging
+import queue
 import sys
 import threading
 import time
@@ -52,6 +54,7 @@ from typing import Dict, List, Optional
 import serial
 import serial.tools.list_ports
 from flask import Flask, Response, jsonify, request
+from flask_sock import Sock
 
 
 # ---------------------------------------------------------------------------
@@ -92,10 +95,14 @@ def rssi_byte_to_dbm(b: int) -> int:
 # ---------------------------------------------------------------------------
 
 class ChatState:
+    """Хранилище сообщений + рассылка новых сообщений всем подписанным
+    WebSocket-соединениям (каждое — своя очередь queue.Queue)."""
+
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.messages: List[Dict] = []
         self._id_counter = itertools.count(1)
+        self._subscribers: List["queue.Queue[Dict]"] = []
 
     def add(self, direction: str, text: str, rssi: Optional[int] = None) -> Dict:
         with self.lock:
@@ -107,11 +114,29 @@ class ChatState:
                 "rssi": rssi,
             }
             self.messages.append(msg)
-            return msg
+            subscribers = list(self._subscribers)
+        for q in subscribers:
+            q.put(msg)
+        return msg
 
     def since(self, last_id: int) -> List[Dict]:
         with self.lock:
             return [m for m in self.messages if m["id"] > last_id]
+
+    def snapshot(self) -> List[Dict]:
+        with self.lock:
+            return list(self.messages)
+
+    def subscribe(self) -> "queue.Queue[Dict]":
+        q: "queue.Queue[Dict]" = queue.Queue()
+        with self.lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: "queue.Queue[Dict]") -> None:
+        with self.lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
 
 
 chat = ChatState()
@@ -171,11 +196,12 @@ def reader_thread(stop_event: threading.Event, settle_s: float = 0.08) -> None:
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+sock = Sock(app)
 
-# Werkzeug по умолчанию пишет access-log на КАЖДЫЙ HTTP-запрос — при опросе
-# /api/messages раз в секунду это быстро забивает journalctl бесполезными
-# строками. Оставляем только предупреждения/ошибки; события LoRa (RX/TX)
-# логируются отдельно через print() ниже.
+# Werkzeug по умолчанию пишет access-log на КАЖДЫЙ HTTP-запрос. Раньше это
+# было заметно из-за поллинга раз в секунду; с WebSocket запросов гораздо
+# меньше, но всё равно оставляем только предупреждения/ошибки — события
+# LoRa (RX/TX) логируются отдельно через print() ниже.
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 PAGE_HTML = """<!doctype html>
@@ -241,17 +267,14 @@ PAGE_HTML = """<!doctype html>
 </div>
 
 <script>
-let lastId = 0;
 const chatEl = document.getElementById('chat');
 const statusEl = document.getElementById('status');
 const textEl = document.getElementById('text');
 const sendBtn = document.getElementById('send');
 
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[c]));
-}
+let ws = null;
+let reconnectDelay = 1000;  // растёт до RECONNECT_MAX при обрывах связи
+const RECONNECT_MAX = 10000;
 
 function renderMessage(m) {
   const empty = document.getElementById('empty');
@@ -277,49 +300,50 @@ function renderMessage(m) {
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
-async function poll() {
-  try {
-    const resp = await fetch('/api/messages?since=' + lastId);
-    if (!resp.ok) throw new Error('bad status ' + resp.status);
-    const msgs = await resp.json();
-    for (const m of msgs) {
-      renderMessage(m);
-      lastId = Math.max(lastId, m.id);
-    }
-    statusEl.textContent = 'подключено';
-    statusEl.classList.remove('offline');
-  } catch (e) {
-    statusEl.textContent = 'нет связи с сервером';
-    statusEl.classList.add('offline');
-  } finally {
-    setTimeout(poll, 1000);
-  }
+function setStatus(text, offline) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle('offline', !!offline);
+  sendBtn.disabled = !!offline;
 }
 
-async function sendMessage() {
-  const text = textEl.value.trim();
-  if (!text) return;
-  sendBtn.disabled = true;
-  try {
-    const resp = await fetch('/api/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
-    });
-    if (resp.ok) {
-      const m = await resp.json();
-      renderMessage(m);
-      lastId = Math.max(lastId, m.id);
-      textEl.value = '';
-    } else {
-      alert('Не удалось отправить сообщение');
+function connectWebSocket() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
+
+  ws.addEventListener('open', () => {
+    setStatus('подключено', false);
+    reconnectDelay = 1000;
+  });
+
+  ws.addEventListener('message', (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch (e) {
+      return;
     }
-  } catch (e) {
-    alert('Ошибка сети при отправке');
-  } finally {
-    sendBtn.disabled = false;
-    textEl.focus();
-  }
+    if (msg.type === 'message') {
+      renderMessage(msg.data);
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    setStatus('нет связи с сервером, переподключение…', true);
+    setTimeout(connectWebSocket, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.5, RECONNECT_MAX);
+  });
+
+  ws.addEventListener('error', () => {
+    ws.close();
+  });
+}
+
+function sendMessage() {
+  const text = textEl.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ text }));
+  textEl.value = '';
+  textEl.focus();
 }
 
 sendBtn.addEventListener('click', sendMessage);
@@ -330,16 +354,72 @@ textEl.addEventListener('keydown', (e) => {
   }
 });
 
-poll();
+setStatus('подключение…', true);
+connectWebSocket();
 </script>
 </body>
 </html>
 """
 
 
+def send_over_lora(text: str) -> Dict:
+    """Собирает кадр, пишет его в порт и кладёт TX-сообщение в ChatState
+    (что автоматически разошлёт его всем подключённым WebSocket-клиентам).
+    Бросает serial.SerialException при ошибке записи в порт."""
+    if ser is None:
+        raise serial.SerialException("serial port not open")
+    frame = build_frame(text.encode("utf-8"), cfg.peer_address, cfg.channel)
+    with serial_write_lock:
+        ser.write(frame)
+        ser.flush()
+    msg = chat.add("tx", text)
+    print(f"[TX] {text!r}", flush=True)
+    return msg
+
+
 @app.route("/")
 def index() -> Response:
     return Response(PAGE_HTML, mimetype="text/html")
+
+
+@sock.route("/ws")
+def ws_chat(ws) -> None:
+    """WebSocket-соединение с браузером: при подключении отдаём всю историю,
+    затем в реальном времени пушим новые RX/TX-сообщения и принимаем текст
+    для отправки в эфир. flask-sock синхронный, поэтому в одном потоке на
+    соединение чередуем короткое неблокирующее чтение от клиента с проверкой
+    очереди исходящих сообщений."""
+    q = chat.subscribe()
+    try:
+        for m in chat.snapshot():
+            ws.send(json.dumps({"type": "message", "data": m}))
+
+        while True:
+            try:
+                raw = ws.receive(timeout=0.2)
+            except Exception:
+                break  # соединение закрыто клиентом или сетевая ошибка
+
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    text = (data.get("text") or "").strip()
+                except (TypeError, ValueError, AttributeError):
+                    text = ""
+                if text:
+                    try:
+                        send_over_lora(text)
+                    except serial.SerialException as e:
+                        ws.send(json.dumps({"type": "error", "message": f"serial write failed: {e}"}))
+
+            try:
+                while True:
+                    msg = q.get_nowait()
+                    ws.send(json.dumps({"type": "message", "data": msg}))
+            except queue.Empty:
+                pass
+    finally:
+        chat.unsubscribe(q)
 
 
 @app.route("/api/messages")
@@ -362,24 +442,18 @@ def api_status():
 
 @app.route("/api/send", methods=["POST"])
 def api_send():
+    """REST-эндпоинт оставлен для отладки/скриптов (curl и т.п.);
+    сама веб-страница теперь отправляет сообщения через /ws."""
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty text"}), 400
-    if ser is None:
-        return jsonify({"error": "serial port not open"}), 503
 
-    frame = build_frame(text.encode("utf-8"), cfg.peer_address, cfg.channel)
     try:
-        with serial_write_lock:
-            ser.write(frame)
-            ser.flush()
+        msg = send_over_lora(text)
     except serial.SerialException as e:
         return jsonify({"error": f"serial write failed: {e}"}), 500
 
-    msg = chat.add("tx", text)
-    rssi_note = ""  # для TX RSSI не применим
-    print(f"[TX] {text!r}{rssi_note}", flush=True)
     return jsonify(msg)
 
 
