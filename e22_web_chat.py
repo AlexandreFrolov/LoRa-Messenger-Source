@@ -117,10 +117,17 @@ chat = ChatState()
 serial_write_lock = threading.Lock()  # защищает ser.write от одновременных HTTP-запросов
 ser: Optional[serial.Serial] = None
 cfg: Optional[argparse.Namespace] = None  # аргументы командной строки, заполняются в main()
+reader_thread_obj: Optional[threading.Thread] = None  # для проверки живости через /api/status
 
 
 def reader_thread(stop_event: threading.Event, settle_s: float = 0.08) -> None:
-    """Фоновое чтение из порта — всё принятое из эфира кладём в ChatState."""
+    """Фоновое чтение из порта — всё принятое из эфира кладём в ChatState.
+
+    ВАЖНО: это daemon-поток. Если тут вылетит необработанное исключение,
+    поток молча умрёт и приём перестанет работать без каких-либо следов
+    в веб-интерфейсе — поэтому ловим Exception целиком, а не только
+    SerialException, и всегда печатаем trace в консоль/journalctl.
+    """
     while not stop_event.is_set():
         try:
             if ser.in_waiting == 0:
@@ -141,11 +148,21 @@ def reader_thread(stop_event: threading.Event, settle_s: float = 0.08) -> None:
 
             text = payload.decode("utf-8", errors="replace")
             chat.add("rx", text, rssi_dbm)
+            rssi_part = f" RSSI={rssi_dbm}dBm" if rssi_dbm is not None else ""
+            print(f"[RX] {text!r}{rssi_part}", flush=True)
 
         except serial.SerialException as e:
+            print(f"[RX] порт недоступен, поток чтения остановлен: {e}", file=sys.stderr, flush=True)
             chat.add("rx", f"[ошибка чтения порта: {e}]")
             stop_event.set()
             break
+
+        except Exception:
+            # Любая другая ошибка (например, при разборе конкретного пакета)
+            # не должна останавливать приём последующих сообщений.
+            import traceback
+            traceback.print_exc()
+            time.sleep(0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +341,18 @@ def api_messages():
     return jsonify(chat.since(since))
 
 
+@app.route("/api/status")
+def api_status():
+    with chat.lock:
+        last_msg = chat.messages[-1] if chat.messages else None
+    return jsonify({
+        "serial_port_open": ser is not None and ser.is_open,
+        "reader_thread_alive": reader_thread_obj is not None and reader_thread_obj.is_alive(),
+        "total_messages": len(chat.messages),
+        "last_message": last_msg,
+    })
+
+
 @app.route("/api/send", methods=["POST"])
 def api_send():
     data = request.get_json(silent=True) or {}
@@ -350,7 +379,7 @@ def api_send():
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global ser, cfg
+    global ser, cfg, reader_thread_obj
 
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -399,6 +428,7 @@ def main() -> None:
     stop_event = threading.Event()
     t = threading.Thread(target=reader_thread, args=(stop_event,), daemon=True)
     t.start()
+    reader_thread_obj = t
 
     print(f"Веб-интерфейс: http://{cfg.web_host}:{cfg.web_port}/  "
           f"(если сервер запущен на удалённой машине — используйте её IP вместо 0.0.0.0)")
