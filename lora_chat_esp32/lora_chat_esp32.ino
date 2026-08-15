@@ -65,7 +65,7 @@ volatile bool ledOn = false;
 
 // ======================= Радио параметры сети ================================
 #define LORA_CHANNEL   19       // 850.125 + 19*1 = 869.125 МГц (868.7-869.2, LBT обязателен)
-#define NET_ID         0x02
+#define NET_ID         0x00
 #define BROADCAST_ADDH 0xFF
 #define BROADCAST_ADDL 0xFF     // широковещательный адрес модуля E22 (см. datasheet EBYTE)
 
