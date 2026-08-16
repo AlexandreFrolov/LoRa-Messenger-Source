@@ -313,7 +313,8 @@ bool sendChatOverLora(const char *nick, const char *text) {
     } else {
       Serial.printf("[TX] chunk %d/%d OK (msgId=%u)\r\n", i + 1, chunkTotal, msgId);
     }
-    delay(50); // небольшая пауза между фрагментами, чтобы не забить эфир
+    //delay(50); // небольшая пауза между фрагментами, чтобы не забить эфир
+    delay(2520); // небольшая пауза между фрагментами, чтобы не забить эфир
   }
 
   ledFlash(0, 0, 60, 300); // синяя вспышка = своя отправка
