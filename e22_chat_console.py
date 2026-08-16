@@ -76,6 +76,7 @@ EBYTE, максимальный dwell time LBT). USB-версия донгла �
 """
 
 import argparse
+import random
 import struct
 import sys
 import threading
@@ -157,13 +158,24 @@ class ChatPacket:
     chunk_index: int
     chunk_total: int
     nick: str
-    text: str
+    text_bytes: bytes
+    # ВАЖНО: text_bytes — это СЫРЫЕ байты фрагмента, а не декодированная строка.
+    # Раньше каждый чанк резался по границе символа UTF-8 (_split_utf8) и сразу
+    # декодировался в str — из-за этого непоследние чанки могли оказаться короче
+    # TEXT_CHUNK_LEN, оставляя внутри общего буфера сборки ЛИШНИЙ нулевой байт-
+    # паддинг посреди сообщения. Прошивка ESP32 копит все чанки в один C-буфер и
+    # обрезает текст по ПЕРВОМУ нулевому байту (String(char*)) — такой "случайный"
+    # нуль внутри буфера обрывал сообщение задолго до конца, хотя более поздние
+    # чанки были получены и собраны верно. Теперь чанки режутся строго по
+    # TEXT_CHUNK_LEN сырых байт (см. send_text), декодирование в UTF-8 происходит
+    # один раз, после того как собраны ВСЕ фрагменты сообщения — так нулевой байт-
+    # паддинг гарантированно может встретиться только в самом последнем чанке.
 
     def _body_bytes(self) -> bytes:
-        # Ник и текст — UTF-8; ник почти наверняка обрежется при кириллице
-        # (10 байт буфера ~ 4-5 кириллических символов) — предупреждаем в send_text().
+        # Ник — UTF-8; почти наверняка обрежется при кириллице (10 байт буфера
+        # ~ 4-5 кириллических символов) — предупреждаем в send_text().
         nick_b = self.nick.encode("utf-8", errors="replace")[: NICK_LEN - 1]
-        text_b = self.text.encode("utf-8", errors="replace")[:TEXT_CHUNK_LEN]
+        text_b = self.text_bytes[:TEXT_CHUNK_LEN]
         return struct.pack(
             BODY_FMT,
             self.msg_id & 0xFF,
@@ -201,8 +213,19 @@ class ChatPacket:
             BODY_FMT, body
         )
         nick = nick_b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-        text = text_b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-        return ChatPacket(msg_id, from_addr, ttl, chunk_index, chunk_total, nick, text)
+
+        # Обрезать по первому нулевому байту можно ТОЛЬКО для последнего чанка
+        # сообщения — там нулевой паддинг легитимен и однозначен. Для всех
+        # промежуточных чанков берём все TEXT_CHUNK_LEN байт как есть: они
+        # заполнены отправителем ровно полностью (см. send_text), нулевой байт
+        # внутри них не паддинг, а (крайне маловероятно, но не исключено при
+        # errors='replace') часть реального содержимого.
+        if chunk_index == chunk_total - 1:
+            text_bytes = text_b.split(b"\x00", 1)[0]
+        else:
+            text_bytes = text_b
+
+        return ChatPacket(msg_id, from_addr, ttl, chunk_index, chunk_total, nick, text_bytes)
 
 
 # ============================ Сборка многочанковых сообщений ========================
@@ -246,7 +269,8 @@ class Reassembler:
             if self._is_seen(key):
                 return None
             self._remember_seen(key)
-            return (pkt.nick, pkt.text)
+            text = pkt.text_bytes.decode("utf-8", errors="replace")
+            return (pkt.nick, text)
 
         if self._is_seen(key):
             return None
@@ -256,7 +280,22 @@ class Reassembler:
             slot = {"nick": pkt.nick, "chunk_total": pkt.chunk_total, "chunks": {}}
             self._slots[key] = slot
 
-        slot["chunks"][pkt.chunk_index] = pkt.text
+        slot["chunks"][pkt.chunk_index] = pkt.text_bytes
+
+        if len(slot["chunks"]) >= slot["chunk_total"]:
+            # Конкатенируем СЫРЫЕ байты всех фрагментов и декодируем UTF-8
+            # только один раз, целиком — так граница между чанками (даже если
+            # она приходится на середину многобайтового символа) никак не
+            # портит итоговый текст.
+            full_bytes = b"".join(
+                slot["chunks"].get(i, b"") for i in range(slot["chunk_total"])
+            )
+            del self._slots[key]
+            self._remember_seen(key)
+            text = full_bytes.decode("utf-8", errors="replace")
+            return (slot["nick"], text)
+
+        return None
 
         if len(slot["chunks"]) >= slot["chunk_total"]:
             full_text = "".join(slot["chunks"].get(i, "") for i in range(slot["chunk_total"]))
@@ -279,7 +318,10 @@ class LoraChatClient:
         self.rssi_enabled = rssi_enabled
         self.debug = debug
         self.packet_len_on_wire = PACKET_LEN + (1 if rssi_enabled else 0)
-        self.msg_id_counter = 0
+        # Случайный старт вместо 0 — снижает вероятность, что при перезапуске
+        # скрипта msgId совпадёт с ещё не "протухшим" слотом сборки на ESP32
+        # (см. REASM_SLOT_TIMEOUT_MS / stale-slot guard в прошивке v2).
+        self.msg_id_counter = random.randint(0, 255)
         self.reasm = Reassembler()
         self._buf = bytearray()
         self._stop = threading.Event()
@@ -291,28 +333,22 @@ class LoraChatClient:
         return bytes([BROADCAST_ADDH, BROADCAST_ADDL, self.channel]) + payload
 
     @staticmethod
-    def _split_utf8(text: str, max_bytes: int) -> list:
-        """Режем текст на куски по max_bytes байт в UTF-8, не разрывая символы."""
-        chunks = []
-        current = ""
-        current_len = 0
-        for ch in text:
-            ch_len = len(ch.encode("utf-8"))
-            if current_len + ch_len > max_bytes and current:
-                chunks.append(current)
-                current = ch
-                current_len = ch_len
-            else:
-                current += ch
-                current_len += ch_len
-        if current:
-            chunks.append(current)
-        return chunks
+    def _split_bytes(data: bytes, max_bytes: int) -> list:
+        """Режем СЫРЫЕ байты на куски по max_bytes, не заботясь о границах
+        символов UTF-8 — резать посреди многобайтового символа безопасно,
+        т.к. декодирование делается один раз, после сборки ВСЕХ чанков
+        (см. Reassembler.feed). Раньше здесь была character-aware нарезка
+        (_split_utf8), из-за которой непоследний чанк мог оказаться короче
+        TEXT_CHUNK_LEN — это оставляло "случайный" нулевой байт-паддинг
+        посреди буфера сборки на приёмнике и обрывало сообщение раньше
+        времени (см. комментарий у ChatPacket.text_bytes)."""
+        if not data:
+            return [b""]
+        return [data[i:i + max_bytes] for i in range(0, len(data), max_bytes)]
 
     def send_text(self, text: str) -> None:
-        chunks = self._split_utf8(text, TEXT_CHUNK_LEN)
-        if not chunks:
-            chunks = [""]
+        data = text.encode("utf-8", errors="replace")
+        chunks = self._split_bytes(data, TEXT_CHUNK_LEN)
         if len(chunks) > MAX_CHUNKS:
             print(f"[!] Сообщение слишком длинное, обрезано до {MAX_CHUNKS} фрагментов "
                   f"(~{MAX_CHUNKS * TEXT_CHUNK_LEN} байт) — прошивка больше не соберёт")
@@ -321,7 +357,18 @@ class LoraChatClient:
         msg_id = self.msg_id_counter
         self.msg_id_counter = (self.msg_id_counter + 1) & 0xFF
 
-        for i, chunk_text in enumerate(chunks):
+        if self.debug:
+            print(f"[DEBUG SPLIT] msgId={msg_id} всего чанков={len(chunks)}")
+            for i, c in enumerate(chunks):
+                # Лениво декодируем только для отображения в дебаге — на границе
+                # чанка возможен символ-заменитель '\ufffd', если чанк обрывает
+                # многобайтовый символ. Это ожидаемо и не влияет на итоговый
+                # текст, который будет собран и раскодирован целиком на приёмнике.
+                preview = c.decode("utf-8", errors="replace")
+                print(f"[DEBUG SPLIT]   chunk {i}: {len(c)} байт (raw), "
+                      f"превью={preview!r}")
+
+        for i, chunk_bytes in enumerate(chunks):
             pkt = ChatPacket(
                 msg_id=msg_id,
                 from_addr=self.node_addr,
@@ -329,7 +376,7 @@ class LoraChatClient:
                 chunk_index=i,
                 chunk_total=len(chunks),
                 nick=self.nick,
-                text=chunk_text,
+                text_bytes=chunk_bytes,
             )
             frame = self.build_tx_frame(pkt)
             self.ser.write(frame)
@@ -363,9 +410,15 @@ class LoraChatClient:
 
         if self.debug:
             rssi_part = f" RSSI={rssi_dbm}dBm" if rssi_dbm is not None else ""
+            # Декодируем только для отображения — на границе непоследнего чанка
+            # возможен '\ufffd' (символ-заменитель), если чанк обрывает
+            # многобайтовый символ. Реальная сборка текста происходит в
+            # Reassembler.feed() из СЫРЫХ байт всех чанков, эта строка не влияет
+            # на итоговый результат.
+            preview = pkt.text_bytes.decode("utf-8", errors="replace")
             print(f"[DEBUG RX] fromAddr=0x{pkt.from_addr:02X} msgId={pkt.msg_id} "
                   f"ttl={pkt.ttl} chunk={pkt.chunk_index+1}/{pkt.chunk_total} "
-                  f"nick='{pkt.nick}' text='{pkt.text}'{rssi_part}")
+                  f"nick='{pkt.nick}' text='{preview}'{rssi_part}")
 
         if pkt.from_addr == self.node_addr:
             # свой же пакет, вернувшийся через ретрансляцию соседним узлом — не дублируем
@@ -479,6 +532,9 @@ def main() -> None:
     try:
         while True:
             line = input()
+            if args.debug:
+                print(f"[DEBUG INPUT] len(chars)={len(line)} "
+                      f"len(utf8 bytes)={len(line.encode('utf-8'))} repr={line!r}")
             if line.strip():
                 client.send_text(line)
     except (KeyboardInterrupt, EOFError):

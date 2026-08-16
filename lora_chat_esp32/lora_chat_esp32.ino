@@ -171,6 +171,9 @@ struct ReassemblyBuf {
   uint32_t lastUpdateMs;
 };
 #define REASM_SLOTS 4
+#define REASM_SLOT_TIMEOUT_MS 15000UL  // если сборка с этим ключом (fromAddr+msgId)
+                                        // не обновлялась дольше 15с, считаем её
+                                        // "протухшей" и не продолжаем её новыми чанками
 ReassemblyBuf reasm[REASM_SLOTS];
 
 // ======================= История сообщений (для новых веб-клиентов) =========
@@ -359,6 +362,21 @@ void handleIncomingPacket(ChatPacket &pkt, int rssi) {
   int slot = -1;
   for (int i = 0; i < REASM_SLOTS; i++) {
     if (reasm[i].used && reasm[i].fromAddr == pkt.fromAddr && reasm[i].msgId == pkt.msgId) {
+      bool stale = (millis() - reasm[i].lastUpdateMs) > REASM_SLOT_TIMEOUT_MS;
+      bool totalMismatch = reasm[i].chunkTotal != pkt.chunkTotal;
+      if (stale || totalMismatch) {
+        // Совпадение ключа (fromAddr,msgId) со старой, уже неактуальной сборкой —
+        // это НЕ продолжение той сборки, а начало нового сообщения, которому
+        // "повезло" получить тот же msgId (например, после перезапуска клиента
+        // на ПК, где счётчик msgId стартует заново). Сбрасываем слот, а не
+        // домешиваем в него новые чанки поверх старых недо/уже собранных данных.
+        Serial.printf("[REASM] слот from=%u msgId=%u сброшен (stale=%d, "
+                      "totalMismatch=%d: было %u, стало %u) — считаем новым сообщением\r\n",
+                      pkt.fromAddr, pkt.msgId, stale, totalMismatch,
+                      reasm[i].chunkTotal, pkt.chunkTotal);
+        reasm[i].used = false;
+        continue; // не назначаем slot=i — пусть ниже найдётся/создастся заново
+      }
       slot = i; break;
     }
   }
