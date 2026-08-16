@@ -63,6 +63,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
+import random
 
 import serial
 import serial.tools.list_ports
@@ -204,7 +205,8 @@ class LoraChatClient:
         self.rssi_enabled = rssi_enabled
         self.debug = debug
         self.packet_len_on_wire = PACKET_LEN + (1 if rssi_enabled else 0)
-        self.msg_id_counter = 0
+        #self.msg_id_counter = 0
+        self.msg_id_counter = random.randint(0, 255)
         self.reasm = Reassembler()
         self._buf = bytearray()
         self._stop = threading.Event()
@@ -259,7 +261,8 @@ class LoraChatClient:
             frame = self.build_tx_frame(pkt)
             self.ser.write(frame)
             self.ser.flush()
-            time.sleep(0.05)  # пауза между фрагментами — как delay(50) в sendChatOverLora()
+            #time.sleep(0.05)  # пауза между фрагментами — как delay(50) в sendChatOverLora()
+            time.sleep(2.5) 
 
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] Вы: {text}")
