@@ -12,7 +12,7 @@ EByte_LoRa_E22, ESPAsyncWebServer/AsyncTCP и Arduino-core для ESP32-S3.
 ```
 lora_chat_esp32/
 ├── lora_chat_esp32.ino     ← основной скетч
-├── partitions.csv          ← кастомная таблица разделов (большой LittleFS)
+├── partitions.csv          ← таблица разделов (большой LittleFS)
 └── data/                   ← файлы веб-интерфейса, заливаются в LittleFS
     ├── index.html
     ├── style.css
