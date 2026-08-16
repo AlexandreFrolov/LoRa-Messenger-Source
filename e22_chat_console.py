@@ -4,10 +4,21 @@ e22_chat_console.py — консольный LoRa-чат для Windows/Linux, �
 с прошивкой lora_chat_esp32.ino (ESP32-S3-N16R8 + Ebyte E22-900T22D,
 проект LoRa-2026).
 
+v2: формат ChatPacket расширен на 1 байт CRC8 (совместимо с прошивкой v2).
+Раньше пакет правильного размера, но с повреждённым в эфире содержимым
+(коллизия при ретрансляции, помеха) принимался как валидный и портил
+сборку многочастных сообщений ("обрезание" текста). Теперь каждый пакет
+несёт контрольную сумму по первым 53 байтам, и приёмник отбрасывает
+пакет, если CRC не совпала, вместо того чтобы отдать в реассемблинг мусор.
+
+ВАЖНО: эта версия скрипта НЕСОВМЕСТИМА со старой прошивкой (без CRC8) —
+там был 53-байтный пакет, здесь 54 байта. Прошивка и скрипт должны быть
+обновлены одновременно на обоих концах.
+
 Скрипт реализует тот же бинарный протокол ChatPacket (msgId/fromAddr/ttl/
-chunkIndex/chunkTotal/nick/text), что и прошивка, поэтому PC с USB-донглом
-E22-900T22U подключается к сети LoRa-2026 как ещё один равноправный узел:
-может отправлять сообщения (с разбиением на фрагменты по 38 байт) и
+chunkIndex/chunkTotal/nick/text/crc8), что и прошивка, поэтому PC с USB-
+донглом E22-900T22U подключается к сети LoRa-2026 как ещё один равноправный
+узел: может отправлять сообщения (с разбиением на фрагменты по 38 байт) и
 принимать/собирать чужие, включая ретранслированные другими узлами.
 
 ============================ Конфигурация донгла ===================================
@@ -28,7 +39,7 @@ e22_configure.py / RF_Settings GUI так же, как показывает e22_
 аргументы командной строки (--node-addr, --channel, --no-rssi).
 ======================================================================================
 
-Протокол ChatPacket (см. lora_chat_esp32.ino), 53 байта на линии, без
+Протокол ChatPacket (см. lora_chat_esp32.ino, v2), 54 байта на линии, без
 выравнивания (аналог #pragma pack(1)):
 
     uint8_t  msgId        — счётчик сообщений отправителя (0..255)
@@ -38,9 +49,17 @@ e22_configure.py / RF_Settings GUI так же, как показывает e22_
     uint8_t  chunkTotal     — всего фрагментов в сообщении
     char     nick[10]       — ник, с завершающим нулём
     char     text[38]       — фрагмент текста (UTF-8)
+    uint8_t  crc8           — CRC8 (полином 0x07) по всем 53 байтам выше
 
 Если у донгла включён RSSI-байт (как в примере на COM13), на линии за
-каждым 53-байтным пакетом следует ещё 1 байт RSSI.
+каждым 54-байтным пакетом следует ещё 1 байт RSSI.
+
+ВАЖНО про паузу между чанками при отправке: модуль E22 может выполнять
+LBT (прослушивание эфира) перед каждой передачей до 2 секунд (см. даташит
+EBYTE, максимальный dwell time LBT). USB-версия донгла не даёт доступа к
+пину AUX как отдельному сигналу (в отличие от TTL/SPI модулей), поэтому
+аппаратного подтверждения "модуль освободился" нет — используется
+фиксированная пауза между записями в порт с запасом на худший случай LBT.
 
 Установка зависимостей:
     pip install pyserial
@@ -63,17 +82,21 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
-import random
 
 import serial
 import serial.tools.list_ports
 
-# ============================ Протокол (см. lora_chat_esp32.ino) ====================
+# ============================ Протокол (см. lora_chat_esp32.ino, v2) ================
 NICK_LEN = 10
 TEXT_CHUNK_LEN = 38
-PACKET_FMT = f"<BBBBB{NICK_LEN}s{TEXT_CHUNK_LEN}s"
-PACKET_LEN = struct.calcsize(PACKET_FMT)
-assert PACKET_LEN == 53, PACKET_LEN  # 5 + 10 + 38, как в комментарии .ino
+
+# Тело пакета без CRC (5 полей + nick + text) — 53 байта, ровно как раньше.
+BODY_FMT = f"<BBBBB{NICK_LEN}s{TEXT_CHUNK_LEN}s"
+BODY_LEN = struct.calcsize(BODY_FMT)
+assert BODY_LEN == 53, BODY_LEN
+
+# Полный пакет на линии: тело + 1 байт CRC8 = 54 байта.
+PACKET_LEN = BODY_LEN + 1
 
 BROADCAST_ADDH = 0xFF
 BROADCAST_ADDL = 0xFF
@@ -82,41 +105,25 @@ DEFAULT_FLOOD_TTL = 3
 MAX_CHUNKS = 8  # см. receivedMask/REASM_SLOTS в .ino — сообщения длиннее
                 # MAX_CHUNKS * TEXT_CHUNK_LEN байт прошивка не соберёт
 
+# Пауза между записью чанков в serial-порт. LBT может занимать до 2с
+# (см. datasheet EBYTE, "maximum dwell time of LBT is 2 seconds") — берём
+# запас сверх этого максимума + время эфирной передачи пакета на 2.4kbps.
+INTER_CHUNK_DELAY_SEC = 2.2
 
-@dataclass
-class ChatPacket:
-    msg_id: int
-    from_addr: int
-    ttl: int
-    chunk_index: int
-    chunk_total: int
-    nick: str
-    text: str
 
-    def pack(self) -> bytes:
-        # Ник и текст — UTF-8; ник почти наверняка обрежется при кириллице
-        # (10 байт буфера ~ 4-5 кириллических символов) — предупреждаем в send_text().
-        nick_b = self.nick.encode("utf-8", errors="replace")[: NICK_LEN - 1]
-        text_b = self.text.encode("utf-8", errors="replace")[:TEXT_CHUNK_LEN]
-        return struct.pack(
-            PACKET_FMT,
-            self.msg_id & 0xFF,
-            self.from_addr & 0xFF,
-            self.ttl & 0xFF,
-            self.chunk_index & 0xFF,
-            self.chunk_total & 0xFF,
-            nick_b.ljust(NICK_LEN, b"\x00"),
-            text_b.ljust(TEXT_CHUNK_LEN, b"\x00"),
-        )
-
-    @staticmethod
-    def unpack(raw: bytes) -> "ChatPacket":
-        msg_id, from_addr, ttl, chunk_index, chunk_total, nick_b, text_b = struct.unpack(
-            PACKET_FMT, raw
-        )
-        nick = nick_b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-        text = text_b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-        return ChatPacket(msg_id, from_addr, ttl, chunk_index, chunk_total, nick, text)
+# ============================ CRC8 (полином 0x07, как в прошивке) ===================
+def crc8(data: bytes) -> int:
+    """CRC-8-CCITT, полином 0x07, старший бит вперёд, начальное значение 0.
+    Должно побитово совпадать с crc8() в lora_chat_esp32.ino."""
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x07) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc
 
 
 def rssi_byte_to_dbm(b: int) -> int:
@@ -141,40 +148,107 @@ def list_ports() -> None:
             print(f"{p.device}\t{p.description}")
 
 
+# ============================ ChatPacket (тело + CRC8) ==============================
+@dataclass
+class ChatPacket:
+    msg_id: int
+    from_addr: int
+    ttl: int
+    chunk_index: int
+    chunk_total: int
+    nick: str
+    text: str
+
+    def _body_bytes(self) -> bytes:
+        # Ник и текст — UTF-8; ник почти наверняка обрежется при кириллице
+        # (10 байт буфера ~ 4-5 кириллических символов) — предупреждаем в send_text().
+        nick_b = self.nick.encode("utf-8", errors="replace")[: NICK_LEN - 1]
+        text_b = self.text.encode("utf-8", errors="replace")[:TEXT_CHUNK_LEN]
+        return struct.pack(
+            BODY_FMT,
+            self.msg_id & 0xFF,
+            self.from_addr & 0xFF,
+            self.ttl & 0xFF,
+            self.chunk_index & 0xFF,
+            self.chunk_total & 0xFF,
+            nick_b.ljust(NICK_LEN, b"\x00"),
+            text_b.ljust(TEXT_CHUNK_LEN, b"\x00"),
+        )
+
+    def pack(self) -> bytes:
+        """Тело + CRC8 — итоговые 54 байта, как ждёт прошивка."""
+        body = self._body_bytes()
+        return body + bytes([crc8(body)])
+
+    @staticmethod
+    def unpack(raw: bytes) -> "ChatPacket":
+        """Разбирает 54-байтный пакет. Бросает ValueError, если CRC не совпала —
+        вызывающий код должен отловить это и отбросить пакет, не пытаясь
+        скормить его в реассемблинг (см. _process_packet)."""
+        if len(raw) != PACKET_LEN:
+            raise struct.error(f"ожидалось {PACKET_LEN} байт, получено {len(raw)}")
+
+        body = raw[:BODY_LEN]
+        received_crc = raw[BODY_LEN]
+        calc_crc = crc8(body)
+        if calc_crc != received_crc:
+            raise ValueError(
+                f"CRC8 не совпала: получено 0x{received_crc:02X}, "
+                f"посчитано 0x{calc_crc:02X} — пакет повреждён"
+            )
+
+        msg_id, from_addr, ttl, chunk_index, chunk_total, nick_b, text_b = struct.unpack(
+            BODY_FMT, body
+        )
+        nick = nick_b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        text = text_b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        return ChatPacket(msg_id, from_addr, ttl, chunk_index, chunk_total, nick, text)
+
+
 # ============================ Сборка многочанковых сообщений ========================
 class Reassembler:
     """Python-аналог ReassemblyBuf/handleIncomingPacket() из lora_chat_esp32.ino:
     копит фрагменты по (fromAddr, msgId) и отдаёт готовый (nick, text), когда
     получены все chunkTotal фрагментов. Также хранит кэш уже показанных
-    сообщений (аналог seenCache), чтобы не выводить дубликаты, приходящие
-    через ретрансляцию соседними узлами."""
+    сообщений (аналог seenCache) с TTL по времени, чтобы не выводить дубликаты
+    от ретрансляции соседними узлами, но при этом не "залипать" навечно на
+    старых msgId (например, после перезапуска этого же скрипта)."""
+
+    SEEN_TTL_SEC = 120.0  # как SEEN_CACHE_TTL_MS в прошивке
 
     def __init__(self, seen_cache_size: int = 32):
         self._slots = {}          # (from_addr, msg_id) -> {"nick", "chunk_total", "chunks"}
-        self._seen: set = set()
+        self._seen: dict = {}     # key -> timestamp
         self._seen_order: list = []
         self._seen_cache_size = seen_cache_size
 
+    def _is_seen(self, key) -> bool:
+        ts = self._seen.get(key)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > self.SEEN_TTL_SEC:
+            return False  # запись протухла — считаем сообщение новым
+        return True
+
     def _remember_seen(self, key) -> None:
-        if key in self._seen:
-            return
-        self._seen.add(key)
-        self._seen_order.append(key)
-        if len(self._seen_order) > self._seen_cache_size:
-            old = self._seen_order.pop(0)
-            self._seen.discard(old)
+        if key not in self._seen:
+            self._seen_order.append(key)
+            if len(self._seen_order) > self._seen_cache_size:
+                old = self._seen_order.pop(0)
+                self._seen.pop(old, None)
+        self._seen[key] = time.monotonic()
 
     def feed(self, pkt: ChatPacket) -> Optional[tuple]:
         """Возвращает (nick, text), когда сообщение полностью собрано, иначе None."""
         key = (pkt.from_addr, pkt.msg_id)
 
         if pkt.chunk_total <= 1:
-            if key in self._seen:
+            if self._is_seen(key):
                 return None
             self._remember_seen(key)
             return (pkt.nick, pkt.text)
 
-        if key in self._seen:
+        if self._is_seen(key):
             return None
 
         slot = self._slots.get(key)
@@ -205,8 +279,7 @@ class LoraChatClient:
         self.rssi_enabled = rssi_enabled
         self.debug = debug
         self.packet_len_on_wire = PACKET_LEN + (1 if rssi_enabled else 0)
-        #self.msg_id_counter = 0
-        self.msg_id_counter = random.randint(0, 255)
+        self.msg_id_counter = 0
         self.reasm = Reassembler()
         self._buf = bytearray()
         self._stop = threading.Event()
@@ -261,8 +334,10 @@ class LoraChatClient:
             frame = self.build_tx_frame(pkt)
             self.ser.write(frame)
             self.ser.flush()
-            #time.sleep(0.05)  # пауза между фрагментами — как delay(50) в sendChatOverLora()
-            time.sleep(2.5) 
+            if i < len(chunks) - 1:
+                # пауза перед СЛЕДУЮЩИМ чанком — с запасом на LBT (до 2с по
+                # даташиту) + airtime текущего пакета на 2.4kbps
+                time.sleep(INTER_CHUNK_DELAY_SEC)
 
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] Вы: {text}")
@@ -277,6 +352,11 @@ class LoraChatClient:
 
         try:
             pkt = ChatPacket.unpack(payload)
+        except ValueError as e:
+            # CRC8 не совпала — пакет повреждён (коллизия в эфире, помеха и т.п.)
+            if self.debug:
+                print(f"[DEBUG CRC] отброшен повреждённый пакет ({len(payload)} байт): {e}")
+            return
         except struct.error as e:
             print(f"[!] Ошибка разбора пакета ({len(payload)} байт): {e}")
             return
@@ -325,6 +405,7 @@ class LoraChatClient:
 
 
 def main() -> None:
+    global INTER_CHUNK_DELAY_SEC
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="показать список доступных портов")
@@ -343,10 +424,15 @@ def main() -> None:
     ap.add_argument("--no-rssi", action="store_true",
                      help="донгл сконфигурирован БЕЗ RSSI-байта в пакете "
                           "(по умолчанию считаем, что RSSI байт включён, как в примере)")
+    ap.add_argument("--chunk-delay", type=float, default=INTER_CHUNK_DELAY_SEC,
+                     help=f"пауза между чанками в секундах при отправке длинных сообщений "
+                          f"(по умолчанию {INTER_CHUNK_DELAY_SEC}с — с запасом на LBT до 2с "
+                          "по даташиту EBYTE; уменьшайте осторожно и проверяйте на реальных "
+                          "многочанковых сообщениях)")
     ap.add_argument("--debug", action="store_true",
                      help="показывать сырые байты с порта и разобранные поля пакета "
                           "ДО фильтрации own-address — полезно для диагностики "
-                          "'сообщения не приходят обратно'")
+                          "'сообщения не приходят обратно' и повреждённых по CRC пакетов")
     args = ap.parse_args()
 
     if args.list:
@@ -358,6 +444,8 @@ def main() -> None:
         ap.error("--node-addr должен быть в диапазоне 0..255 (однобайтовый fromAddr)")
     if not (0 <= args.channel <= 255):
         ap.error("--channel должен быть в диапазоне 0..255")
+
+    INTER_CHUNK_DELAY_SEC = args.chunk_delay
 
     try:
         ser = serial.Serial(args.port, args.baud, timeout=0.1)
@@ -380,7 +468,9 @@ def main() -> None:
     print(f"Узел: addr=0x{args.node_addr:02X}, channel={args.channel}, nick='{args.nick}', "
           f"TTL={args.ttl}, RSSI байт: {'вкл' if client.rssi_enabled else 'выкл'}")
     print(f"Размер пакета на линии: {client.packet_len_on_wire} байт "
-          f"(payload {PACKET_LEN}{' + 1 RSSI' if client.rssi_enabled else ''})")
+          f"(payload {PACKET_LEN} = {BODY_LEN} тело + 1 CRC8"
+          f"{' + 1 RSSI' if client.rssi_enabled else ''})")
+    print(f"Пауза между чанками при отправке: {INTER_CHUNK_DELAY_SEC}с")
     print("Вводите текст и жмите Enter для отправки в чат LoRa-2026. Ctrl+C — выход.\n")
 
     t = threading.Thread(target=client.reader_loop, daemon=True)

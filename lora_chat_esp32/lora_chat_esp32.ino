@@ -1,17 +1,34 @@
 /* ============================================================================
  * LoRa-2026 Chat — автономный чат на ESP32-S3-N16R8 + Ebyte E22-900T22D
  *
+ * v2: добавлена CRC8-проверка целостности ChatPacket. Причина: на линии
+ * ПК -> ESP32 (и при коллизиях ретранслируемых пакетов в эфире) иногда
+ * приходит пакет правильного размера, но с повреждённым содержимым
+ * (например, "нулевым" text[] у одного из чанков многочастного сообщения).
+ * Раньше такой пакет принимался как валидный и портил сборку сообщения
+ * (String(char*) обрывался на первом \0, сообщение "обрезалось").
+ * Теперь каждый пакет несёт контрольную сумму последних 5+10+38 байт,
+ * и модуль отбрасывает пакет, если CRC не совпала — вместо того чтобы
+ * скормить мусор в reassembly-буфер.
+ *
  * Полностью заменяет связку "Raspberry Pi (hostapd/dnsmasq) + Flask +
  * e22_web_chat.py": сама плата поднимает Wi-Fi точку доступа, отдаёт веб-
  * интерфейс, держит WebSocket с браузером и обменивается сообщениями по LoRa.
  *
  * Радиочасть (конфигурация модуля E22, LBT, fixedTransmission) построена
- * на основе e22_soft_repeater.ino. Добавлено:
+ * на основе e22_soft_repeater.ino. Реализовано:
  *   - протокол чат-пакета с ником, TTL и разбиением длинных сообщений на части;
  *   - управляемая флуд-ретрансляция (каждый узел, приняв чужой пакет
- *     с TTL > 0, уменьшает TTL и пересылает его дальше — это заменяет
- *     отдельный узел-репитер из прошлой схемы);
- *   - дедупликация уже виденных пакетов (по fromAddr+msgId).
+ *     с TTL > 0, уменьшает TTL и пересылает его дальше);
+ *   - дедупликация уже виденных пакетов (по fromAddr+msgId), с TTL-таймаутом
+ *     на запись в кэше, чтобы повторно использованные msgId (например, после
+ *     перезапуска клиента на ПК) не считались вечными дублями;
+ *   - CRC8-проверка целостности пакета перед обработкой.
+ *
+ * ВАЖНО (breaking change): размер ChatPacket увеличился на 1 байт (crc8).
+ * Python-скрипт e22_chat_console.py тоже нужно обновить под новый формат
+ * пакета (PACKET_FMT/PACKET_LEN + вычисление/проверка CRC8), иначе ESP32
+ * будет отбрасывать все пакеты с ПК как повреждённые (CRC не совпадёт).
  *
  * Плата: ESP32-S3-N16R8 (16 МБ Flash, 8 МБ PSRAM)
  * ВАЖНО: Tools -> USB CDC On Boot -> Disabled
@@ -84,29 +101,64 @@ struct ChatPacket {
   uint8_t chunkTotal;           // всего фрагментов в сообщении
   char    nick[NICK_LEN];
   char    text[TEXT_CHUNK_LEN];
+  uint8_t crc8;                 // CRC8 по всем предыдущим полям (msgId..text)
 };
 #pragma pack(pop)
-// Итоговый размер пакета: 5 + 10 + 38 = 53 байта полезной нагрузки.
+// Итоговый размер пакета: 5 + 10 + 38 + 1(crc8) = 54 байта полезной нагрузки.
 // С учётом заголовка fixedTransmission (ADDH,ADDL,CHAN = 3 байта) на воздух
-// уходит ~56 байт — проверьте по факту через RF_Settings/логи, что это
+// уходит ~57 байт — проверьте по факту через RF_Settings/логи, что это
 // укладывается в лимит вашей конфигурации SF/BW (см. E22-900T22D datasheet).
 
+// ======================= CRC8 (полином 0x07, CRC-8-CCITT, старший бит вперёд) ====
+uint8_t crc8(const uint8_t *data, size_t len) {
+  uint8_t crc = 0x00;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      if (crc & 0x80) {
+        crc = (uint8_t)((crc << 1) ^ 0x07);
+      } else {
+        crc = (uint8_t)(crc << 1);
+      }
+    }
+  }
+  return crc;
+}
+
+// Посчитать и проставить crc8 в пакет (перед отправкой/ретрансляцией)
+void fillCrc(ChatPacket &pkt) {
+  pkt.crc8 = crc8((const uint8_t *)&pkt, sizeof(ChatPacket) - sizeof(pkt.crc8));
+}
+
+// Проверить crc8 у принятого пакета
+bool crcValid(const ChatPacket &pkt) {
+  uint8_t calc = crc8((const uint8_t *)&pkt, sizeof(ChatPacket) - sizeof(pkt.crc8));
+  return calc == pkt.crc8;
+}
+
 // ======================= Дедупликация и сборка фрагментов ===================
-struct SeenEntry { uint8_t fromAddr; uint8_t msgId; bool used; };
+struct SeenEntry { uint8_t fromAddr; uint8_t msgId; bool used; uint32_t ts; };
 #define SEEN_CACHE_SIZE 32
+#define SEEN_CACHE_TTL_MS 120000UL   // запись в кэше "протухает" через 2 минуты
 SeenEntry seenCache[SEEN_CACHE_SIZE];
 uint8_t seenCacheHead = 0;
 
 bool alreadySeen(uint8_t fromAddr, uint8_t msgId) {
+  uint32_t now = millis();
   for (int i = 0; i < SEEN_CACHE_SIZE; i++) {
     if (seenCache[i].used && seenCache[i].fromAddr == fromAddr && seenCache[i].msgId == msgId) {
-      return true;
+      // защита от переполнения millis() (~49 дней): считаем протухшей и разницу "в минус"
+      uint32_t age = now - seenCache[i].ts;
+      if (age < SEEN_CACHE_TTL_MS) {
+        return true;
+      }
+      return false; // запись устарела — считаем это новым сообщением
     }
   }
   return false;
 }
 void rememberSeen(uint8_t fromAddr, uint8_t msgId) {
-  seenCache[seenCacheHead] = { fromAddr, msgId, true };
+  seenCache[seenCacheHead] = { fromAddr, msgId, true, millis() };
   seenCacheHead = (seenCacheHead + 1) % SEEN_CACHE_SIZE;
 }
 
@@ -245,6 +297,8 @@ bool sendChatOverLora(const char *nick, const char *text) {
     size_t chunkLen = min((size_t)TEXT_CHUNK_LEN, len - offset);
     memcpy(pkt.text, text + offset, chunkLen);
 
+    fillCrc(pkt); // считаем CRC после того, как все поля заполнены
+
     ResponseStatus rs = e22.sendFixedMessage(
         BROADCAST_ADDH, BROADCAST_ADDL, LORA_CHANNEL,
         (uint8_t *)&pkt, (uint8_t)sizeof(pkt));
@@ -266,6 +320,8 @@ bool sendChatOverLora(const char *nick, const char *text) {
 // Пересылка уже готового (чужого) пакета дальше — флуд-ретрансляция
 void repeatPacket(ChatPacket &pkt) {
   pkt.ttl -= 1;
+  fillCrc(pkt); // ttl изменился -> CRC нужно пересчитать заново, иначе следующий
+                // узел отбросит пакет как повреждённый
   delay(random(20, 120)); // случайная задержка, чтобы соседние узлы не били в эфир одновременно
   ResponseStatus rs = e22.sendFixedMessage(
       BROADCAST_ADDH, BROADCAST_ADDL, LORA_CHANNEL,
@@ -363,7 +419,17 @@ void loraTask(void *param) {
         memcpy(&pkt, rsc.data, sizeof(ChatPacket));
         int rssi = (int)rsc.rssi - 256;
         rsc.close(); // библиотека сама free() выделенный под data буфер
-        handleIncomingPacket(pkt, rssi);
+
+        if (!crcValid(pkt)) {
+          // Пакет пришёл правильного размера, но с повреждённым содержимым
+          // (коллизия в эфире, помеха и т.п.) — отбрасываем, чтобы не
+          // скормить мусор в reassembly-буфер и не "обрезать" сообщение.
+          Serial.printf("[CRC] отброшен повреждённый пакет: from=%u msgId=%u "
+                        "chunk=%u/%u (RSSI %d)\r\n",
+                        pkt.fromAddr, pkt.msgId, pkt.chunkIndex + 1, pkt.chunkTotal, rssi);
+        } else {
+          handleIncomingPacket(pkt, rssi);
+        }
       } else {
         Serial.print(F("Ошибка приёма: "));
         Serial.println(rsc.status.getResponseDescription());
@@ -462,7 +528,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
-  Serial.println(F("=== LoRa-2026 Chat (ESP32-S3-N16R8 + E22-900T22D) ==="));
+  Serial.println(F("=== LoRa-2026 Chat (ESP32-S3-N16R8 + E22-900T22D), v2 CRC8 ==="));
 
   randomSeed(esp_random());
 
@@ -502,6 +568,7 @@ void setup() {
   Serial.print(F("Конфигурация E22: "));
   Serial.println(ok ? F("OK") : F("FAIL"));
   Serial.printf("Адрес узла: 00:%02X, NETID: %02X, канал: %d\r\n", NODE_ADDL, NET_ID, LORA_CHANNEL);
+  Serial.printf("Размер ChatPacket: %d байт (с учётом CRC8)\r\n", (int)sizeof(ChatPacket));
 
   xTaskCreatePinnedToCore(loraTask, "loraTask", 8192, NULL, 1, NULL, 0);
 
