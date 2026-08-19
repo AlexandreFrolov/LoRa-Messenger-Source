@@ -37,9 +37,6 @@ lora_chat_esp32/
 | AsyncTCP | 3.5.0 | ESP32Async | форк, актуальный для ESP32 core 3.x |
 | ESPAsyncWebServer | 3.12.0 | ESP32Async | форк |
 
-Если ставите не через Library Manager, а вручную с GitHub — берите форки
-`ESP32Async/AsyncTCP` и `ESP32Async/ESPAsyncWebServer`, оригинальные
-me-no-dev давно не обновлялись и могут не собраться на новых core.
 
 ## 4. Плагин для заливки данных в LittleFS
 
