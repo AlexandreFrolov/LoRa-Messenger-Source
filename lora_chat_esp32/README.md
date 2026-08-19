@@ -48,17 +48,17 @@ Arduino IDE 2.x сам не умеет заливать папку `data/` — �
 2. Положить файл в `~/.arduino15/plugins/` (Linux/Win) или
    `~/Library/Arduino15/plugins/` (macOS), создать папку, если её нет.
 3. Перезапустить Arduino IDE. Появится пункт в палитре команд
-   (Ctrl+Shift+P) → **"Upload LittleFS to Pico/ESP8266/ESP32"**.
+   (Ctrl+Shift+P или F1) → **"Upload LittleFS to Pico/ESP8266/ESP32"**.
 
 ## 5. Настройки платы (Tools)
 
 | Параметр | Значение |
 |---|---|
 | Board | ESP32S3 Dev Module |
-| USB CDC On Boot | **Disabled** (иначе `Serial.print` пропадает — см. комментарий из `e22_read_config.ino`) |
+| USB CDC On Boot | **Disabled** |
 | PSRAM | OPI PSRAM |
 | Flash Size | 16MB |
-| Partition Scheme | Custom → указать `partitions.csv` из проекта (или через `Tools → Partition Scheme → Custom` и подложить файл рядом со скетчем — Arduino IDE подхватывает `partitions.csv` автоматически, если он лежит в папке скетча) |
+| Partition Scheme | Custom → указать  через `Tools → Partition Scheme → Custom` и разместить файл `partitions.csv` рядом со скетчем — Arduino IDE подхватывает `partitions.csv` автоматически, если он лежит в папке скетча) |
 | Upload Speed | 921600 (при проблемах — снизить до 460800) |
 
 ## 6. Настройка адреса узла перед каждой прошивкой
