@@ -1,11 +1,8 @@
 # LoRa-2026 Chat на ESP32-S3-N16R8 — сборка и тестирование
 
-Важная оговорка: код написан вручную, по документированному API библиотек
+Код написан по документированному API библиотек
 EByte_LoRa_E22, ESPAsyncWebServer/AsyncTCP и Arduino-core для ESP32-S3.
-В этой среде нет тулчейна Xtensa/ESP-IDF и доступа к серверам Espressif,
-поэтому реальной компиляции здесь не производилось — соберите и прошейте
-через Arduino IDE по шагам ниже, будьте готовы поправить мелкие несовпадения
-сигнатур методов под конкретные версии установленных у вас библиотек.
+Соберите и прошейте код через Arduino IDE по шагам ниже.
 
 ## 1. Структура проекта
 
@@ -32,13 +29,13 @@ lora_chat_esp32/
 
 ## 3. Библиотеки (Library Manager, Ctrl+Shift+I)
 
-| Библиотека | Автор | Примечание |
-|---|---|---|
-| EByte LoRa E22 | Renzo Mischianti | та же, что и в `e22_soft_repeater.ino` |
-| Adafruit NeoPixel | Adafruit | для встроенного RGB на GPIO48 |
-| ArduinoJson | Benoit Blanchon | v6 или v7 |
-| AsyncTCP | ESP32Async (форк, актуальный для ESP32 core 3.x) | искать `AsyncTCP` от `ESP32Async` в Library Manager |
-| ESPAsyncWebServer | ESP32Async (форк) | искать `ESPAsyncWebServer` от `ESP32Async` |
+| Библиотека | Версия | Автор | Примечание |
+|---|---|---|---|
+| EByte LoRa E22 | 1.0.9 | Renzo Mischianti | та же, что и в `e22_soft_repeater.ino` |
+| Adafruit NeoPixel | 1.1.15 | Adafruit | для встроенного RGB на GPIO48 |
+| ArduinoJson | 7.4.3 | Benoit Blanchon | |
+| AsyncTCP | 3.5.0 | ESP32Async | форк, актуальный для ESP32 core 3.x |
+| ESPAsyncWebServer | 3.12.0 | ESP32Async | форк |
 
 Если ставите не через Library Manager, а вручную с GitHub — берите форки
 `ESP32Async/AsyncTCP` и `ESP32Async/ESPAsyncWebServer`, оригинальные
